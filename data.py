@@ -143,18 +143,22 @@ class InfiniteZarrDataset(IterableDataset):
                 # Handle read errors (e.g. network glitch on mounted drive)
                 continue
 
-def get_infinite_dataloader(data_root, batch_size, num_workers=4):
+def get_infinite_dataloader(
+    data_root, 
+    batch_size, 
+    crop_size=(8, 8, 8),
+    resolution_key='s0',
+    num_workers=4
+):
     """
-    Factory function to create the loader.
+    Factory function to create the loader with configurable crop size.
     """
     dataset = InfiniteZarrDataset(
         data_root=data_root,
-        crop_size=(32, 128, 128), # Example depth 32
-        resolution_key='s0'
+        crop_size=crop_size,       # Pass the argument here
+        resolution_key=resolution_key
     )
 
-    # Note: No sampler is used with IterableDataset
-    # Validations shuffle is also handled by the internal RNG in __iter__
     return DataLoader(
         dataset,
         batch_size=batch_size,

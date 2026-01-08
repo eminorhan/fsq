@@ -6,16 +6,11 @@ import numpy as np
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
-from torch.distributed.checkpoint.stateful import Stateful
-from torchdata.stateful_dataloader import StatefulDataLoader
-
-from torch.utils.data import IterableDataset
-from datasets import load_dataset
-from datasets.distributed import split_dataset_by_node
 from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
 
 from model import TransformerFSQ
+from data import get_infinite_dataloader
 
 
 def setup_distributed():
@@ -26,6 +21,7 @@ def setup_distributed():
     torch.cuda.set_device(local_rank)
     print(f"Distributed setup: Rank {rank}/{world_size} on device {local_rank}")
     return rank, world_size, local_rank
+
 
 def cleanup_distributed():
     dist.destroy_process_group()
@@ -38,8 +34,10 @@ def get_lr_lambda(current_step, warmup_steps, train_steps):
 
 
 if __name__ == "__main__":
+
     rank, world_size, local_rank = setup_distributed()
 
+    DATA_ROOT = "/lustre/blizzard/stf218/scratch/emin/seg3d/data"  # root directory where EM volumes are stored
     CHECKPOINT_DIR = 'ckpts'
     CHECKPOINT_INTERVAL = 50_000
     LOG_INTERVAL = 1_000
@@ -47,7 +45,10 @@ if __name__ == "__main__":
 
     # Data Params
     BATCH_SIZE = 64
-    INPUT_DIM = np.prod(PATCH_SIZE)
+    CROP_SIZE = (8, 8, 8)
+    INPUT_DIM = np.prod(CROP_SIZE)
+    RESOLUTION_KEY = 's0'
+    NUM_WORKERS = 0
 
     # FSQ Levels
     levels = [8, 8, 7, 7, 6, 6] 
@@ -81,9 +82,8 @@ if __name__ == "__main__":
     if rank == 0:
         print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
 
-    # Dataset
-    ds = IterablePatchDataset("eminorhan/neural-pile-rodent", PATCH_SIZE, world_size, rank)
-    dl = DPAwareDataLoader(rank, ds, batch_size=BATCH_SIZE)
+    # Data loader
+    dl = get_infinite_dataloader(DATA_ROOT, BATCH_SIZE, CROP_SIZE, RESOLUTION_KEY, NUM_WORKERS)
     dl_iter = iter(dl)
 
     if LOAD_CHECKPOINT_PATH and rank == 0 and os.path.exists(LOAD_CHECKPOINT_PATH):
@@ -156,15 +156,19 @@ if __name__ == "__main__":
                 
                 plt.figure(figsize=(8, 4))
                 for i in range(min(4, BATCH_SIZE)):
+                    # Reshape to 3D first
+                    orig_vol = data_vis[i].view(*CROP_SIZE)
+                    rec_vol = x_vis[i].view(*CROP_SIZE)
+                    
                     plt.subplot(2, 4, i+1)
-                    plt.imshow(data_vis[i].view(PATCH_SIZE[0], PATCH_SIZE[1]), cmap='jet')
+                    plt.imshow(orig_vol[CROP_SIZE[0] // 2], cmap='jet')
                     plt.axis('off')
-                    plt.title("Orig")
+                    plt.title("Orig (Mid-Slice)")
                     
                     plt.subplot(2, 4, i+5)
-                    plt.imshow(x_vis[i].view(PATCH_SIZE[0], PATCH_SIZE[1]), cmap='jet')
+                    plt.imshow(rec_vol[CROP_SIZE[0] // 2], cmap='jet')
                     plt.axis('off')
-                    plt.title("Rec")
+                    plt.title("Rec (Mid-Slice)")
 
                 plt.tight_layout()
                 plt.savefig(f"{CHECKPOINT_DIR}/vis_{train_step}.png")
@@ -173,11 +177,12 @@ if __name__ == "__main__":
             if train_step % CHECKPOINT_INTERVAL == 0:
                 save_path = f"{CHECKPOINT_DIR}/ckpt_{train_step}.pth"
                 torch.save({
-                    'train_step': train_step,
-                    'model_state_dict': model.module.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                }, save_path)
+                        'train_step': train_step,
+                        'model_state_dict': model.module.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                    }, save_path
+                )
                 print(f"Checkpoint saved: {save_path}")
 
     cleanup_distributed()
