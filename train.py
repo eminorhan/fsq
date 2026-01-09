@@ -8,9 +8,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from typing import Any, Dict, List, Tuple
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
-from model import TransformerFSQ
-from data import get_infinite_dataloader
+from model import FSQ_VAE
+from data import ZarrRandomSubvolumeDataset
 
 
 def setup_distributed():
@@ -38,28 +39,26 @@ if __name__ == "__main__":
     rank, world_size, local_rank = setup_distributed()
 
     DATA_ROOT = "/lustre/blizzard/stf218/scratch/emin/seg3d/data"  # root directory where EM volumes are stored
-    CHECKPOINT_DIR = 'ckpts'
+    CHECKPOINT_DIR = "ckpts"
     CHECKPOINT_INTERVAL = 50_000
     LOG_INTERVAL = 1_000
-    LOAD_CHECKPOINT_PATH = None 
+    LOAD_CHECKPOINT_PATH = None
 
-    # Data Params
+    # Data params
     BATCH_SIZE = 64
     CROP_SIZE = (8, 8, 8)
     INPUT_DIM = np.prod(CROP_SIZE)
     RESOLUTION_KEY = 's0'
     NUM_WORKERS = 0
 
-    # FSQ Levels
+    # Model params
     levels = [8, 8, 7, 7, 6, 6] 
-
-    # Transformer Hyperparams
-    D_MODEL = 256
-    NUM_HEADS = 4
-    NUM_ENCODER_LAYERS = 4
-    NUM_DECODER_LAYERS = 4
+    ENCODER_HIDDEN_DIM = 256
+    DECODER_HIDDEN_DIM = 256
+    ENCODER_DEPTH = 2
+    DECODER_DEPTH = 2
     
-    # Training Params
+    # Training params
     TRAIN_STEPS = 500_000
     WARMUP_STEPS = 5_000
     LEARNING_RATE = 3e-4
@@ -69,13 +68,13 @@ if __name__ == "__main__":
     scheduler_state_to_load = None
 
     # Model initialization
-    model = TransformerFSQ(
+    model = FSQ_VAE(
         levels=levels,
         input_dim=INPUT_DIM,
-        d_model=D_MODEL,
-        num_heads=NUM_HEADS,
-        num_encoder_layers=NUM_ENCODER_LAYERS,
-        num_decoder_layers=NUM_DECODER_LAYERS
+        encoder_hidden_dim=ENCODER_HIDDEN_DIM,
+        decoder_hidden_dim=DECODER_HIDDEN_DIM,
+        encoder_depth=ENCODER_DEPTH,
+        decoder_depth=DECODER_DEPTH,
     )
 
     model.to(local_rank)
@@ -83,7 +82,8 @@ if __name__ == "__main__":
         print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
 
     # Data loader
-    dl = get_infinite_dataloader(DATA_ROOT, BATCH_SIZE, CROP_SIZE, RESOLUTION_KEY, NUM_WORKERS)
+    dataset = ZarrRandomSubvolumeDataset(data_root=DATA_ROOT, patch_size=CROP_SIZE, resolution=RESOLUTION_KEY, seed=1234)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     dl_iter = iter(dl)
 
     if LOAD_CHECKPOINT_PATH and rank == 0 and os.path.exists(LOAD_CHECKPOINT_PATH):
@@ -102,7 +102,7 @@ if __name__ == "__main__":
     # DDP Wrap
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda s: get_lr_lambda(s, WARMUP_STEPS, TRAIN_STEPS))
     
     if optimizer_state_to_load: optimizer.load_state_dict(optimizer_state_to_load)

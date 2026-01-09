@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
+
 
 def round_ste(z: torch.Tensor) -> torch.Tensor:
     """
@@ -10,23 +10,28 @@ def round_ste(z: torch.Tensor) -> torch.Tensor:
     z_hat = torch.round(z)
     return z + (z_hat - z).detach()
 
+
 class FSQ(nn.Module):
     """
-    Finite Scalar Quantization (FSQ) Module.
-    Implementation mirrors the design in Appendix A.1 of the paper.
+    Finite Scalar Quantization (FSQ) Module
+    
+    This is a PyTorch implementation of the FSQ method from: https://arxiv.org/abs/2309.15505
     """
     def __init__(self, levels: list[int]):
         super().__init__()
+        # TODO: check dtypes
+        # [d]
         self.levels = torch.tensor(levels, dtype=torch.float32)
         self.d = len(levels) # Number of dimensions
-        self.codebook_size = np.prod(levels)
         
-        # Basis for converting indices: [1, L1, L1*L2, ...]
+        # [d], e.g., [1, L1, L1*L2, ...]
         basis = torch.cumprod(torch.tensor([1] + levels[:-1]), dim=0)
         self.register_buffer('basis', basis.to(torch.int64))
         
+        self.codebook_size = np.prod(levels)
+        
         # Pre-calculate for bound function
-        self._levels_np = torch.tensor(levels, dtype=torch.float32)
+        self.register_buffer('_levels_np', torch.tensor(levels, dtype=torch.float32))
         self.register_buffer('half_width', self._levels_np // 2)
         
         eps = 1e-3
@@ -45,12 +50,15 @@ class FSQ(nn.Module):
         """
         Applies the bounding function f(z) before rounding.
         """
+        # This function is a bit complex, but it's a general
+        # way to map z to a range that, when rounded,
+        # produces L distinct integer values.
+        # A simpler version is f:z -> floor(L/2) * tanh(z)
         return torch.tanh(z + self.shift) * self.half_l - self.offset
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """
         Quantizes z, returns the quantized z_hat (normalized).
-        Input shape: (Batch, Sequence, d) or (Batch, d)
         """
         # 1. Bound the input
         z_bounded = self.bound(z)
@@ -58,270 +66,226 @@ class FSQ(nn.Module):
         # 2. Round with STE
         z_hat_integers = round_ste(z_bounded)
         
-        # 3. Renormalize to [-1, 1] range
+        # 3. Renormalize to [-1, 1] range for the decoder
         z_hat_normalized = z_hat_integers / self.half_width
         
         return z_hat_normalized
 
+    def _scale_and_shift(self, z_hat_normalized: torch.Tensor) -> torch.Tensor:
+        """Helper to convert normalized codes to {0, 1, ..., L-1} indices."""
+        return (z_hat_normalized * self.half_width) + self.half_width
+
+    def _scale_and_shift_inverse(self, z_hat_indices: torch.Tensor) -> torch.Tensor:
+        """Helper to convert {0, 1, ..., L-1} indices to normalized codes."""
+        return (z_hat_indices - self.half_width) / self.half_width
+
     def codes_to_indexes(self, z_hat_normalized: torch.Tensor) -> torch.Tensor:
-        """Converts normalized quantized vectors to single integer indices."""
-        z_hat_indices = (z_hat_normalized * self.half_width) + self.half_width
+        """
+        Converts normalized quantized vectors to single integer indices.
+        
+        Args:
+            z_hat_normalized (Tensor): Shape (..., d)
+        Returns:
+            indices (Tensor): Shape (...,)
+        """
+        # Convert from normalized e.g. [-1, 0, 1] to {0, 1, 2}
+        z_hat_indices = self._scale_and_shift(z_hat_normalized)
         z_hat_indices = z_hat_indices.round().to(torch.uint32)
+        
+        # Project to 1D index
         return (z_hat_indices * self.basis).sum(dim=-1).to(torch.uint32)
 
     def indexes_to_codes(self, indices: torch.Tensor) -> torch.Tensor:
-        """Converts single integer indices back to normalized quantized vectors."""
+        """
+        Converts single integer indices back to normalized quantized vectors.
+        
+        Args:
+            indices (Tensor): Shape (...,)
+        Returns:
+            z_hat_normalized (Tensor): Shape (..., d)
+        """
         indices = indices.unsqueeze(-1) # (..., 1)
+        
+        # Cast to int64 (Long) for floor division, as uint32 is not supported
         indices_long = indices.to(torch.int64)
         basis_long = self.basis.to(torch.int64)
+
+        # (..., d)
+        codes_non_centered = (indices_long // basis_long) % self._levels_np
         
-        codes_non_centered = (indices_long // basis_long) % self._levels_np.to(torch.int64)
+        # Convert from {0, 1, 2} back to normalized e.g. [-1, 0, 1]
+        z_hat_normalized = self._scale_and_shift_inverse(codes_non_centered)
         
-        z_hat_normalized = (codes_non_centered - self.half_width) / self.half_width
         return z_hat_normalized
 
-class RotaryEmbedding(nn.Module):
+
+# Transformer like MLPBlock
+class MLPBlock(nn.Module):
     """
-    1D Rotary Positional Embedding (RoPE).
+    A Transformer-style FFN block with pre-normalization.
+    mlp_expansion_factor determines the "bottleneck" size.
     """
-    def __init__(self, dim: int, max_seq_len: int = 10000, base: float = 10000.0):
+    def __init__(self, hidden_dim: int, mlp_expansion_factor: int = 4):
         super().__init__()
-        self.dim = dim
-        self.base = base
-        self.max_seq_len = max_seq_len
+        mlp_dim = hidden_dim * mlp_expansion_factor
         
-        # Precompute cos and sin
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self._set_cos_sin_cache(max_seq_len)
-
-    def _set_cos_sin_cache(self, seq_len: int):
-        self.max_seq_len = seq_len
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Shape: (seq_len, dim/2) -> (seq_len, dim)
-        emb = torch.cat((freqs, freqs), dim=-1)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.fc1 = nn.Linear(hidden_dim, mlp_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(mlp_dim, hidden_dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-normalization
+        h = self.norm(x)
         
-        self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
-        self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
-
-    def forward(self, x: torch.Tensor, seq_len: int = None):
-        """
-        Args:
-            x: (B, Num_Heads, Seq_Len, Head_Dim)
-        Returns:
-            cos, sin with shape (1, 1, Seq_Len, Head_Dim)
-        """
-        if seq_len > self.max_seq_len:
-            self._set_cos_sin_cache(seq_len)
-            
-        return (
-            self.cos_cached[:, :, :seq_len, ...],
-            self.sin_cached[:, :, :seq_len, ...]
-        )
-
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotates half the hidden dims of the input."""
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
-
-def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
-    """
-    Applies RoPE to Q and K.
-    """
-    # Note: RoPE is usually applied in float32 for stability
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return q_embed, k_embed
+        # FFN
+        h = self.fc1(h)
+        h = self.act(h)
+        h = self.fc2(h)
+        
+        # Residual connection
+        return h + x
 
 
-class MultiHeadSelfAttention(nn.Module):
-    """
-    Custom Multi-Head Self Attention with RoPE. No Dropout.
-    """
-    def __init__(self, dim: int, num_heads: int):
+class MLPEncoder(nn.Module):
+    """MLP Encoder for FSQ"""
+    def __init__(self, input_dim: int, hidden_dim: int, fsq_dim: int, depth: int):
         super().__init__()
-        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+                
+        self.proj = nn.Linear(input_dim, hidden_dim)
+        self.proj_act = nn.GELU()
+
+        # A stack of MLP blocks
+        layers = []
+        for _ in range(depth):
+            layers.append(MLPBlock(hidden_dim=hidden_dim))
+
+        self.blocks = nn.Sequential(*layers)
         
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.proj = nn.Linear(dim, dim)
-        
-        # Initialize RoPE
-        self.rope = RotaryEmbedding(self.head_dim)
+        # Final layer norm and projection head
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, fsq_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (Batch, Seq_Len, Dim)
-        """
-        B, N, C = x.shape
         
-        # 1. Compute QKV
-        qkv = self.qkv(x) # (B, N, 3*Dim)
+        # Input layer
+        x = self.proj_act(self.proj(x))
         
-        # 2. Reshape to (B, N, 3, Num_Heads, Head_Dim)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
+        # Pass through blocks
+        x = self.blocks(x)
         
-        # 3. Permute to (3, B, Num_Heads, N, Head_Dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # 4. Apply RoPE
-        cos, sin = self.rope(v, seq_len=N)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        
-        # 5. Attention (No dropout)
-        x = F.scaled_dot_product_attention(
-            q, k, v, 
-            dropout_p=0.0,
-            is_causal=False
-        )
-        
-        # 6. Reshape back: (B, Num_Heads, N, Head_Dim) -> (B, N, Dim)
-        x = x.transpose(1, 2).reshape(B, N, C)
-        
-        # 7. Output projection
-        x = self.proj(x)
-        
-        return x
-
-
-class FeedForward(nn.Module):
-    """FeedForward without Dropout"""
-    def __init__(self, dim: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        hidden_dim = int(dim * mlp_ratio)
-        self.net = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class TransformerBlock(nn.Module):
-    """Transformer Block without Dropout"""
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = MultiHeadSelfAttention(dim, num_heads)
-        self.norm2 = nn.LayerNorm(dim)
-        self.mlp = FeedForward(dim, mlp_ratio)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-
-class CustomTransformerEncoder(nn.Module):
-    def __init__(self, dim: int, depth: int, num_heads: int, mlp_ratio: float = 4.0):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerBlock(dim, num_heads, mlp_ratio)
-            for _ in range(depth)
-        ])
-        self.norm = nn.LayerNorm(dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x)
+        # Normalize
         x = self.norm(x)
+        
+        # Project to FSQ's latent dimension 'd'
+        z_e = self.head(x)
+        return z_e
+
+
+class MLPDecoder(nn.Module):
+    """MLP Decoder for FSQ"""
+    def __init__(self, fsq_dim: int, hidden_dim: int, output_dim: int, depth: int):
+        super().__init__()
+        
+        # Project from FSQ's dim 'd' back to MLP hidden dim
+        self.proj = nn.Linear(fsq_dim, hidden_dim)
+        self.proj_act = nn.GELU()
+        
+        # A stack of MLP blocks
+        layers = []
+        for _ in range(depth):
+            layers.append(MLPBlock(hidden_dim=hidden_dim))
+
+        self.blocks = nn.Sequential(*layers)
+        
+        # Final norm and projection head
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.head = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
+        
+        # Project back to hidden_dim
+        x = self.proj_act(self.proj(z_q))
+                
+        # Pass through decoder
+        x = self.blocks(x)
+        x = self.norm(x)
+                
+        # Pass through decoder head     
+        x = self.head(x)
         return x
 
 
-class TransformerFSQ(nn.Module):
+class FSQ_VAE(nn.Module):
     """
-    Transformer-based VAE with FSQ and RoPE Embeddings.
-    No Dropout.
+    An MLP-based autoencoder using FSQ.
     """
     def __init__(
-        self,
+        self, 
         levels: list[int],
         input_dim: int,
-        d_model: int,
-        num_heads: int,
-        num_encoder_layers: int,
-        num_decoder_layers: int,
-        dim_feedforward_ratio: float = 4.0,
+        encoder_hidden_dim: int,
+        decoder_hidden_dim: int,
+        encoder_depth: int,
+        decoder_depth: int,
     ):
         super().__init__()
         
         self.fsq_dim = len(levels)
-        self.d_model = d_model
         
-        # Encoder
-        self.input_proj = nn.Linear(input_dim, d_model)
+        # MLP Encoder
+        self.encoder = MLPEncoder(input_dim, encoder_hidden_dim, self.fsq_dim, encoder_depth)
         
-        self.encoder = CustomTransformerEncoder(
-            dim=d_model, 
-            depth=num_encoder_layers, 
-            num_heads=num_heads, 
-            mlp_ratio=dim_feedforward_ratio
-        )
-        
-        # Bottleneck
-        self.pre_fsq_proj = nn.Linear(d_model, self.fsq_dim)
-        
-        # FSQ
+        # FSQ Module
         self.fsq = FSQ(levels)
         
-        # Decoder
-        self.post_fsq_proj = nn.Linear(self.fsq_dim, d_model)
-        
-        self.decoder = CustomTransformerEncoder(
-            dim=d_model, 
-            depth=num_decoder_layers, 
-            num_heads=num_heads, 
-            mlp_ratio=dim_feedforward_ratio
-        )
-        
-        self.output_head = nn.Linear(d_model, input_dim)
-        
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            torch.nn.init.zeros_(module.bias)
-            torch.nn.init.ones_(module.weight)
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
-        x = self.encoder(x)
-        z_e = self.pre_fsq_proj(x)
-        return z_e
-
-    def decode(self, z_q: torch.Tensor) -> torch.Tensor:
-        x = self.post_fsq_proj(z_q)
-        x = self.decoder(x)
-        x_rec = self.output_head(x)
-        return x_rec
+        # MLP Decoder
+        self.decoder = MLPDecoder(self.fsq_dim, decoder_hidden_dim, input_dim, decoder_depth)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        z_e = self.encode(x)
-        z_q = self.fsq(z_e)
-        x_hat = self.decode(z_q)
-        return x_hat, z_e, z_q
+        """
+        Full pass for training.
+        x shape: (B, L), normalized to [0, 1].
+        """
+        
+        # Encode
+        z_e = self.encoder(x)  # (B, d)
+        
+        # Quantize
+        # FSQ forward applies to the last dimension
+        z_q_normalized = self.fsq(z_e)  # (B, d)
+        
+        # Decode
+        x_hat = self.decoder(z_q_normalized)  # (B, L)
+                
+        return x_hat, z_e, z_q_normalized
 
     @torch.no_grad()
     def compress(self, x: torch.Tensor) -> torch.Tensor:
-        z_e = self.encode(x)
-        z_q = self.fsq(z_e)
-        indices = self.fsq.codes_to_indexes(z_q)
+        """
+        Compresses the input array into a sequence of integer indices.
+        x_in shape: (B, L), normalized to [0, 1]
+        """        
+        z_e = self.encoder(x)    # (B, d)
+        
+        # Quantize (no STE, but fsq.forward doesn't use it anyway)
+        z_q_normalized = self.fsq(z_e)
+        
+        # Get indices (this is the compressed token indices)
+        indices = self.fsq.codes_to_indexes(z_q_normalized)  # (B,)
+        
         return indices
 
     @torch.no_grad()
     def decompress(self, indices: torch.Tensor) -> torch.Tensor:
-        z_q = self.fsq.indexes_to_codes(indices)
-        x_hat = self.decode(z_q)
+        """
+        Decompresses a sequence of integer indices back into an array.
+        indices shape: (B,)
+        """
+        # (B,) -> (B, d)
+        z_q_normalized = self.fsq.indexes_to_codes(indices)
+        
+        # Decode
+        x_hat = self.decoder(z_q_normalized)  # (B, L)
+        
         return x_hat
