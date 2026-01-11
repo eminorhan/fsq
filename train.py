@@ -39,7 +39,7 @@ if __name__ == "__main__":
     rank, world_size, local_rank = setup_distributed()
 
     DATA_ROOT = "/lustre/blizzard/stf218/scratch/emin/seg3d/data"  # root directory where EM volumes are stored
-    CHECKPOINT_DIR = "ckpts"
+    CHECKPOINT_DIR = "checkpoints"
     CHECKPOINT_INTERVAL = 50_000
     LOG_INTERVAL = 1_000
     LOAD_CHECKPOINT_PATH = None
@@ -82,8 +82,8 @@ if __name__ == "__main__":
         print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
 
     # Data loader
-    dataset = ZarrRandomSubvolumeDataset(data_root=DATA_ROOT, patch_size=CROP_SIZE, resolution=RESOLUTION_KEY, seed=1234)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
+    ds = ZarrRandomSubvolumeDataset(data_root=DATA_ROOT, patch_size=CROP_SIZE, resolution=RESOLUTION_KEY, seed=1234)
+    dl = DataLoader(ds, batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, pin_memory=True)
     dl_iter = iter(dl)
 
     if LOAD_CHECKPOINT_PATH and rank == 0 and os.path.exists(LOAD_CHECKPOINT_PATH):
@@ -125,13 +125,13 @@ if __name__ == "__main__":
         
         # Batch: (Batch_Size, Input_Dim)
         data = batch.to(local_rank, non_blocking=True)
-        data_seq = data.unsqueeze(1) 
+        # print(f"input shape/min/max: {data.shape}/{data.min()}/{data.max()}")
 
         # Forward
-        x_hat, _, _ = model(data_seq)
+        x_hat, _, _ = model(data)
         
         # Loss
-        loss = loss_fn(x_hat, data_seq)
+        loss = loss_fn(x_hat, data)
         
         loss.backward()
         clip_grad_norm_(model.parameters(), max_norm=1.0)

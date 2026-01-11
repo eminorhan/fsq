@@ -61,6 +61,9 @@ class ZarrRandomSubvolumeDataset(IterableDataset):
         vol_path = self.volumes[rng.integers(len(self.volumes))]
         vol_name = vol_path.stem.replace(".zarr", "")
 
+        # # print (for debugging purposes)
+        # print(f"[Rank: {torch.distributed.get_rank()}] Sampling volume: {vol_name}")
+        
         # 2. Resolution array
         arr = find_resolution_array(vol_path, self.resolution)
 
@@ -83,7 +86,6 @@ class ZarrRandomSubvolumeDataset(IterableDataset):
             "resolution": self.resolution,
             "offset": (int(z0), int(y0), int(x0)),
         }
-
         return patch, meta
 
     def __iter__(self):
@@ -93,7 +95,16 @@ class ZarrRandomSubvolumeDataset(IterableDataset):
             patch, meta = self._sample_patch(rng)
 
             patch = torch.from_numpy(np.asarray(patch)).to(self.dtype)
-            patch = patch.flatten()  # flatten array
+
+            # Calculate stats per patch
+            mean = patch.mean()
+            std = patch.std()
+
+            # Normalize to zero mean, unit variance
+            patch = (patch - mean) / (std + 1e-6)
+
+            patch = patch.flatten()
+            # print(f"patch shape: {patch.shape}")
 
             if self.return_metadata:
                 yield patch, meta
