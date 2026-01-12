@@ -40,8 +40,8 @@ if __name__ == "__main__":
 
     DATA_ROOT = "/lustre/blizzard/stf218/scratch/emin/seg3d/data"  # root directory where EM volumes are stored
     CHECKPOINT_DIR = "checkpoints"
-    CHECKPOINT_INTERVAL = 50_000
-    LOG_INTERVAL = 1_000
+    CHECKPOINT_INTERVAL = 55_000
+    LOG_INTERVAL = 5_000
     LOAD_CHECKPOINT_PATH = None
 
     # Data params
@@ -59,7 +59,7 @@ if __name__ == "__main__":
     DECODER_DEPTH = 2
     
     # Training params
-    TRAIN_STEPS = 500_000
+    TRAIN_STEPS = 550_000
     WARMUP_STEPS = 5_000
     LEARNING_RATE = 3e-4
 
@@ -125,14 +125,15 @@ if __name__ == "__main__":
         
         # Batch: (Batch_Size, Input_Dim)
         data = batch.to(local_rank, non_blocking=True)
-        # print(f"input shape/min/max: {data.shape}/{data.min()}/{data.max()}")
+        # print(f"input shape/min/max/mean: {data.shape}/{data.min()}/{data.max()}/{data.mean()}")
 
         # Forward
         x_hat, _, _ = model(data)
-        
+        # print(f"x_hat/data shapes: {x_hat.shape}/{data.shape}")
+
         # Loss
         loss = loss_fn(x_hat, data)
-        
+
         loss.backward()
         clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -150,25 +151,35 @@ if __name__ == "__main__":
                 print(f"Step {train_step} | Loss: {avg_loss:.6f} | LR: {lr:.6f}")
                 running_loss = 0.0
                 
-                # Simple visualization
-                x_vis = x_hat.detach().cpu().squeeze(1) 
-                data_vis = data.detach().cpu()
-                
-                plt.figure(figsize=(8, 4))
-                for i in range(min(4, BATCH_SIZE)):
-                    # Reshape to 3D first
-                    orig_vol = data_vis[i].view(*CROP_SIZE)
-                    rec_vol = x_vis[i].view(*CROP_SIZE)
-                    
-                    plt.subplot(2, 4, i+1)
-                    plt.imshow(orig_vol[CROP_SIZE[0] // 2], cmap='jet')
+                # Get the first item in the batch (index 0)
+                x_vis = x_hat.detach().cpu()[0] 
+                data_vis = data.detach().cpu()[0]
+
+                # Ensure volumes are shaped correctly (D, H, W)
+                orig_vol = data_vis.view(*CROP_SIZE)
+                rec_vol = x_vis.view(*CROP_SIZE)
+
+                # Get the depth (number of slices)
+                num_slices = CROP_SIZE[0]
+
+                # Adjust figure width based on number of slices to keep aspect ratio
+                plt.figure(figsize=(num_slices * 2, 4))
+
+                for z in range(num_slices):
+                    # Top Row: Original Slices
+                    plt.subplot(2, num_slices, z + 1)
+                    plt.imshow(orig_vol[z], cmap='jet')
                     plt.axis('off')
-                    plt.title("Orig (Mid-Slice)")
-                    
-                    plt.subplot(2, 4, i+5)
-                    plt.imshow(rec_vol[CROP_SIZE[0] // 2], cmap='jet')
+                    # Only label the first column to avoid clutter
+                    if z == 0:
+                        plt.title("Original", fontsize=12, pad=10)
+
+                    # Bottom Row: Reconstructed Slices
+                    plt.subplot(2, num_slices, z + 1 + num_slices)
+                    plt.imshow(rec_vol[z], cmap='jet')
                     plt.axis('off')
-                    plt.title("Rec (Mid-Slice)")
+                    if z == 0:
+                        plt.title("Recon", fontsize=12, pad=10)
 
                 plt.tight_layout()
                 plt.savefig(f"{CHECKPOINT_DIR}/vis_{train_step}.png")

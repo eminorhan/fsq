@@ -94,14 +94,7 @@ class ZarrRandomSubvolumeDataset(IterableDataset):
         while True:
             patch, meta = self._sample_patch(rng)
 
-            patch = torch.from_numpy(np.asarray(patch)).to(self.dtype)
-
-            # Calculate stats per patch
-            mean = patch.mean()
-            std = patch.std()
-
-            # Normalize to zero mean, unit variance
-            patch = (patch - mean) / (std + 1e-6)
+            patch = torch.from_numpy(np.asarray(patch) / 12000.0).to(self.dtype) 
 
             patch = patch.flatten()
             # print(f"patch shape: {patch.shape}")
